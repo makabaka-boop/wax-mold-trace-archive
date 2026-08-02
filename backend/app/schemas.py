@@ -353,7 +353,7 @@ class BubbleRecordCreate(BaseModel):
     remark: Optional[str] = None
 
 
-class ReworkRecordCreate(BaseModel):
+class BatchReworkSubmit(BaseModel):
     record_time: datetime
     rework_reason: str
     rework_count: int

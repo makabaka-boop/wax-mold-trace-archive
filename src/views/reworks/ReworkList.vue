@@ -84,7 +84,7 @@
             {{ formatDateTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button type="primary" link @click="viewBatchDetail(row.batch_id)">批次详情</el-button>
             <el-button
@@ -102,6 +102,14 @@
               @click="openSubmitDialog(row)"
             >
               提交复检
+            </el-button>
+            <el-button
+              v-if="canCancel(row)"
+              type="info"
+              link
+              @click="handleCancel(row)"
+            >
+              取消
             </el-button>
           </template>
         </el-table-column>
@@ -292,7 +300,12 @@ const canStart = (row: ReworkRecord) => {
 
 const canSubmit = (row: ReworkRecord) => {
   const isTechnician = userStore.userRole === 'technician' || userStore.userRole === 'admin'
-  return isTechnician && (row.status === 'processing' || row.status === 'pending')
+  return isTechnician && row.status === 'processing'
+}
+
+const canCancel = (row: ReworkRecord) => {
+  const isTechnician = userStore.userRole === 'technician' || userStore.userRole === 'admin'
+  return isTechnician && (row.status === 'pending' || row.status === 'processing')
 }
 
 const loadUsers = async () => {
@@ -419,6 +432,25 @@ const handleSubmit = async () => {
       submitting.value = false
     }
   })
+}
+
+const handleCancel = async (row: ReworkRecord) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认取消第${row.rework_no}次返工单？取消后该返工不再计入统计，批次若没有其他活动返工单将回到待质检状态。`,
+      '取消返工',
+      { type: 'warning', confirmButtonText: '确认取消', cancelButtonText: '再想想' }
+    )
+    await reworkApi.cancel(row.id)
+    ElMessage.success('返工单已取消')
+    loadData()
+    loadBatches()
+  } catch (e: any) {
+    if (e !== 'cancel') {
+      console.error('Cancel rework failed', e)
+      ElMessage.error(e.response?.data?.message || '取消返工失败')
+    }
+  }
 }
 
 onMounted(() => {

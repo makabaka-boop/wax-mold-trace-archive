@@ -134,7 +134,7 @@
           :icon="RefreshLeft"
           @click="openReworkDialog"
         >
-          返工完成
+          提交返工结果
         </el-button>
         <el-button
           v-if="canInitiateRework"
@@ -561,7 +561,7 @@
 
     <el-dialog
       v-model="reworkDialogVisible"
-      title="返工完成"
+      :title="`提交返工结果${activeRework ? `（第${activeRework.rework_no}次返工）` : ''}`"
       width="500px"
       :close-on-click-modal="false"
     >
@@ -742,11 +742,11 @@
           <el-input-number
             v-model="deliveryArchiveForm.delivered_quantity"
             :min="1"
-            :max="batchDetail?.quantity || 10000"
+            :max="reviewPassedQuantity || batchDetail?.quantity || 10000"
             style="width: 100%;"
           />
           <span style="color: #94a3b8; font-size: 12px;">
-            批次试制件数：{{ batchDetail?.quantity || '-' }} 件，交付件数不能超过试制件数
+            复核通过件数：{{ reviewPassedQuantity || '-' }} 件，归档件数不能超过复核通过件数
           </span>
         </el-form-item>
         <el-form-item label="接收方" prop="receiver">
@@ -755,16 +755,16 @@
             placeholder="请输入接收方"
           />
         </el-form-item>
-        <el-form-item label="关联质检结论" prop="quality_conclusion">
+        <el-form-item label="质量结论" prop="quality_conclusion">
           <el-input
             v-model="deliveryArchiveForm.quality_conclusion"
             type="textarea"
             :rows="3"
-            placeholder="自动关联最新质检结论"
+            placeholder="自动带入交付复核通过的最终质量结论"
             disabled
           />
           <span style="color: #94a3b8; font-size: 12px;">
-            系统自动关联最新质检结论，不可修改
+            自动带入交付复核通过的最终质量结论，不可修改
           </span>
         </el-form-item>
         <el-form-item label="交付备注" prop="delivery_remark">
@@ -1010,17 +1010,26 @@ const deliveryArchiveRules: FormRules = {
     { required: true, message: '请输入交付件数', trigger: 'blur' },
     {
       validator: (_rule, value, callback) => {
-        if (value !== null && value !== undefined && batchDetail.value && value > batchDetail.value.quantity) {
-          callback(new Error('交付件数不能超过试制件数'))
-        } else {
+        if (value === null || value === undefined) {
           callback()
+          return
         }
+        if (value <= 0) {
+          callback(new Error('交付件数必须大于0'))
+          return
+        }
+        const maxQty = reviewPassedQuantity.value ?? batchDetail.value?.quantity
+        if (maxQty && value > maxQty) {
+          callback(new Error(`交付件数不能超过复核通过件数（${maxQty}）`))
+          return
+        }
+        callback()
       },
       trigger: 'blur'
     }
   ],
   receiver: [{ required: true, message: '请输入接收方', trigger: 'blur' }],
-  quality_conclusion: [{ required: true, message: '请输入关联质检结论', trigger: 'blur' }]
+  quality_conclusion: [{ required: true, message: '请确认质量结论', trigger: 'blur' }]
 }
 
 const initiateReworkRules: FormRules = {
@@ -1056,11 +1065,21 @@ const canRecordBubble = computed(() => {
   return isTechnician && (status === 'molding' || status === 'reworking')
 })
 
+const activeRework = computed(() => {
+  if (!batchDetail.value?.rework_records) return null
+  const activeStatuses = ['pending', 'processing', 'waiting_inspection']
+  return [...batchDetail.value.rework_records]
+    .filter(r => activeStatuses.includes(r.status))
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0] || null
+})
+
 const canRework = computed(() => {
   if (!batchDetail.value) return false
   const status = batchDetail.value.status
   const isTechnician = userStore.userRole === 'technician' || userStore.userRole === 'admin'
-  return isTechnician && status === 'reworking'
+  if (!isTechnician || status !== 'reworking') return false
+  if (!activeRework.value) return false
+  return activeRework.value.status === 'pending' || activeRework.value.status === 'processing'
 })
 
 const canInspect = computed(() => {
@@ -1091,7 +1110,10 @@ const canInitiateRework = computed(() => {
   if (!batchDetail.value) return false
   const status = batchDetail.value.status
   const isTechnician = userStore.userRole === 'technician' || userStore.userRole === 'admin'
-  return isTechnician && (status === 'pending_inspect' || status === 'reworking')
+  if (!isTechnician) return false
+  if (status === 'deliverable' || status === 'delivered') return false
+  if (activeRework.value) return false
+  return status === 'pending_inspect' || status === 'reworking'
 })
 
 const sortedProcessRecords = computed(() => {
@@ -1235,22 +1257,16 @@ const openDeliveryReviewDialog = () => {
   deliveryReviewDialogVisible.value = true
 }
 
+const reviewPassedQuantity = computed(() => {
+  return batchDetail.value?.delivery_review?.delivered_quantity ?? null
+})
+
 const openDeliveryArchiveDialog = () => {
   deliveryArchiveFormRef.value?.resetFields()
   deliveryArchiveForm.delivery_time = new Date().toISOString().slice(0, 19).replace('T', ' ')
-  deliveryArchiveForm.delivered_quantity = batchDetail.value?.delivery_review?.delivered_quantity ?? batchDetail.value?.quantity ?? null
+  deliveryArchiveForm.delivered_quantity = reviewPassedQuantity.value ?? batchDetail.value?.quantity ?? null
   deliveryArchiveForm.receiver = ''
-  
-  const inspectionRecords = batchDetail.value?.inspection_records || []
-  if (inspectionRecords.length > 0) {
-    const sorted = [...inspectionRecords].sort(
-      (a, b) => new Date(b.inspect_time).getTime() - new Date(a.inspect_time).getTime()
-    )
-    deliveryArchiveForm.quality_conclusion = sorted[0].opinion || '无质检结论'
-  } else {
-    deliveryArchiveForm.quality_conclusion = '无质检记录'
-  }
-  
+  deliveryArchiveForm.quality_conclusion = batchDetail.value?.delivery_review?.final_quality_conclusion || ''
   deliveryArchiveForm.delivery_remark = ''
   deliveryArchiveDialogVisible.value = true
 }
@@ -1338,7 +1354,7 @@ const handleRework = async () => {
     submitting.value = true
     try {
       await batchApi.recordRework(batchId.value, reworkForm)
-      ElMessage.success('返工完成，批次重新进入待质检状态')
+      ElMessage.success('返工结果已提交，批次进入待复检状态')
       reworkDialogVisible.value = false
       loadDetail()
     } catch (e: any) {

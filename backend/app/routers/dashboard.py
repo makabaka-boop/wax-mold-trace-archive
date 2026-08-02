@@ -68,43 +68,71 @@ def get_summary(
     base_query = _apply_batch_filters(base_query, style_id, status, technician_id,
                                       start_date, end_date, keyword)
 
-    total = base_query.count()
-    status_counts = {}
-    for s in STATUS_NAMES:
-        count = base_query.filter(models.Batch.status == s).count()
-        status_counts[s] = count
+    filtered_batch_ids = [b.id for b in base_query.with_entities(models.Batch.id).all()]
+    filtered_batch_id_set = set(filtered_batch_ids)
+
+    total = len(filtered_batch_ids)
+
+    def _count_in_filtered(status_val):
+        if not filtered_batch_ids:
+            return 0
+        return db.query(models.Batch).filter(
+            models.Batch.id.in_(filtered_batch_ids),
+            models.Batch.status == status_val
+        ).count()
+
+    pending_pour_count = _count_in_filtered("pending_pour")
+    molding_count = _count_in_filtered("molding")
+    pending_inspect_count = _count_in_filtered("pending_inspect")
+    reworking_count = _count_in_filtered("reworking")
+    deliverable_count = _count_in_filtered("deliverable")
+    delivered_count = _count_in_filtered("delivered")
+    paused_count = _count_in_filtered("paused")
 
     from .warnings import get_all_warnings_internal
-    warnings = get_all_warnings_internal(db)
+    all_warnings = get_all_warnings_internal(db)
+    warnings = [w for w in all_warnings
+                if w.get("related_type") != "batch" or w.get("related_id") in filtered_batch_id_set]
 
-    pending_review_count = base_query.filter(
-        models.Batch.status == "deliverable",
-        models.Batch.review_status == "pending_review"
-    ).count()
+    pending_review_count = 0
+    if filtered_batch_ids:
+        pending_review_count = db.query(models.Batch).filter(
+            models.Batch.id.in_(filtered_batch_ids),
+            models.Batch.status == "deliverable",
+            models.Batch.review_status == "pending_review"
+        ).count()
 
-    from datetime import datetime
     now = datetime.now()
-    pending_rework_count = db.query(models.ReworkRecord).filter(
+
+    rework_query = db.query(models.ReworkRecord)
+    if filtered_batch_ids:
+        rework_query = rework_query.filter(models.ReworkRecord.batch_id.in_(filtered_batch_ids))
+    else:
+        rework_query = rework_query.filter(models.ReworkRecord.batch_id == -1)
+
+    pending_rework_count = rework_query.filter(
         models.ReworkRecord.status.in_(["pending", "processing"])
     ).count()
-    overdue_rework_count = db.query(models.ReworkRecord).filter(
+
+    overdue_rework_count = rework_query.filter(
         models.ReworkRecord.status.in_(["pending", "processing"]),
         models.ReworkRecord.expected_finish_time.isnot(None),
         models.ReworkRecord.expected_finish_time < now
     ).count()
-    waiting_rework_inspection_count = db.query(models.ReworkRecord).filter(
+
+    waiting_rework_inspection_count = rework_query.filter(
         models.ReworkRecord.status == "waiting_inspection"
     ).count()
 
     summary = schemas.DashboardSummary(
         total_batches=total,
-        pending_pour=status_counts.get("pending_pour", 0),
-        molding=status_counts.get("molding", 0),
-        pending_inspect=status_counts.get("pending_inspect", 0),
-        reworking=status_counts.get("reworking", 0),
-        deliverable=status_counts.get("deliverable", 0),
-        delivered=status_counts.get("delivered", 0),
-        paused=status_counts.get("paused", 0),
+        pending_pour=pending_pour_count,
+        molding=molding_count,
+        pending_inspect=pending_inspect_count,
+        reworking=reworking_count,
+        deliverable=deliverable_count,
+        delivered=delivered_count,
+        paused=paused_count,
         pending_delivery_review=pending_review_count,
         warning_count=len(warnings),
         pending_rework=pending_rework_count,
@@ -206,16 +234,19 @@ def get_pending_inspections(
 
     batches = query.order_by(models.Batch.created_at.desc()).all()
 
+    from .warnings import get_pending_inspect_since
+
     result = []
-    now = datetime.now().date()
+    now = datetime.now()
     for batch in batches:
         cycle = db.query(models.InspectionCycle).filter(
             models.InspectionCycle.style_id == batch.style_id
         ).first()
 
         cycle_days = cycle.cycle_days if cycle else 7
-        days_since_created = (now - batch.created_at.date()).days
-        days_overdue = max(0, days_since_created - cycle_days)
+        pending_since = get_pending_inspect_since(db, batch.id)
+        days_since_pending = (now - pending_since).total_seconds() / 86400
+        days_overdue = max(0, int(days_since_pending - cycle_days))
 
         result.append(schemas.PendingInspectionItem(
             id=batch.id,

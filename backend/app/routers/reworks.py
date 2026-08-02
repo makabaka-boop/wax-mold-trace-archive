@@ -25,6 +25,43 @@ REWORK_STATUS_COLOR_MAP = {
     "cancelled": "#6b7280"
 }
 
+ACTIVE_STATUSES = ("pending", "processing", "waiting_inspection")
+TERMINAL_STATUSES = ("completed", "cancelled")
+
+ALLOWED_TRANSITIONS = {
+    "pending": ("processing", "waiting_inspection", "cancelled"),
+    "processing": ("waiting_inspection", "cancelled"),
+    "waiting_inspection": ("completed", "cancelled"),
+    "completed": (),
+    "cancelled": (),
+}
+
+
+def _get_active_rework(db: Session, batch_id: int) -> Optional[models.ReworkRecord]:
+    return db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.batch_id == batch_id,
+        models.ReworkRecord.status.in_(ACTIVE_STATUSES)
+    ).order_by(models.ReworkRecord.created_at.desc()).first()
+
+
+def _ensure_transition(current: str, target: str):
+    if target not in ALLOWED_TRANSITIONS.get(current, ()):
+        raise HTTPException(
+            status_code=400,
+            detail=f"返工记录当前状态为「{REWORK_STATUS_MAP.get(current, current)}」，不允许变更为「{REWORK_STATUS_MAP.get(target, target)}」"
+        )
+
+
+def _serialize_rework(record: models.ReworkRecord) -> dict:
+    data = schemas.ReworkRecordWithDetails.model_validate(record).model_dump()
+    data["initiator"] = schemas.User.model_validate(record.initiator).model_dump()
+    data["responsible"] = schemas.User.model_validate(record.responsible).model_dump()
+    data["batch_code"] = record.batch.code
+    data["style_name"] = record.batch.style.name
+    data["status_name"] = REWORK_STATUS_MAP.get(record.status, record.status)
+    data["status_color"] = REWORK_STATUS_COLOR_MAP.get(record.status, "#6b7280")
+    return data
+
 
 @router.get("", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
 def get_rework_records(
@@ -39,6 +76,8 @@ def get_rework_records(
     if batch_id:
         query = query.filter(models.ReworkRecord.batch_id == batch_id)
     if status:
+        if status not in REWORK_STATUS_MAP:
+            raise HTTPException(status_code=400, detail="无效的返工状态")
         query = query.filter(models.ReworkRecord.status == status)
     if responsible_id:
         query = query.filter(models.ReworkRecord.responsible_id == responsible_id)
@@ -47,17 +86,7 @@ def get_rework_records(
 
     records = query.order_by(models.ReworkRecord.created_at.desc()).all()
 
-    result = []
-    for record in records:
-        data = schemas.ReworkRecordWithDetails.model_validate(record).model_dump()
-        data["initiator"] = schemas.User.model_validate(record.initiator).model_dump()
-        data["responsible"] = schemas.User.model_validate(record.responsible).model_dump()
-        data["batch_code"] = record.batch.code
-        data["style_name"] = record.batch.style.name
-        data["status_name"] = REWORK_STATUS_MAP.get(record.status, record.status)
-        data["status_color"] = REWORK_STATUS_COLOR_MAP.get(record.status, "#6b7280")
-        result.append(data)
-
+    result = [_serialize_rework(r) for r in records]
     return schemas.ApiResponse(data={"items": result})
 
 
@@ -97,15 +126,7 @@ def get_rework_detail(rework_id: int, db: Session = Depends(get_db)):
     if not record:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    data = schemas.ReworkRecordWithDetails.model_validate(record).model_dump()
-    data["initiator"] = schemas.User.model_validate(record.initiator).model_dump()
-    data["responsible"] = schemas.User.model_validate(record.responsible).model_dump()
-    data["batch_code"] = record.batch.code
-    data["style_name"] = record.batch.style.name
-    data["status_name"] = REWORK_STATUS_MAP.get(record.status, record.status)
-    data["status_color"] = REWORK_STATUS_COLOR_MAP.get(record.status, "#6b7280")
-
-    return schemas.ApiResponse(data=data)
+    return schemas.ApiResponse(data=_serialize_rework(record))
 
 
 @router.post("", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_technician)])
@@ -118,10 +139,29 @@ def create_rework(
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
 
+    if batch.status in ("deliverable", "delivered"):
+        raise HTTPException(status_code=400, detail="批次已进入可交付/已交付状态，不能发起返工")
+
+    responsible = db.query(models.User).filter(models.User.id == rework_in.responsible_id).first()
+    if not responsible:
+        raise HTTPException(status_code=400, detail="所选责任人不存在")
+    if responsible.role != "technician":
+        raise HTTPException(status_code=400, detail="责任人必须为工艺员")
+
+    active = _get_active_rework(db, rework_in.batch_id)
+    if active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该批次已有进行中的返工单（第{active.rework_no}次，状态：{REWORK_STATUS_MAP.get(active.status, active.status)}），请先完成或取消后再发起新的返工"
+        )
+
     last_rework = db.query(models.ReworkRecord).filter(
         models.ReworkRecord.batch_id == rework_in.batch_id
     ).order_by(models.ReworkRecord.rework_no.desc()).first()
     rework_no = (last_rework.rework_no + 1) if last_rework else 1
+
+    if not rework_in.rework_reason or not rework_in.rework_reason.strip():
+        raise HTTPException(status_code=400, detail="返工原因不能为空")
 
     rework = models.ReworkRecord(
         **rework_in.model_dump(),
@@ -131,12 +171,14 @@ def create_rework(
     )
     db.add(rework)
 
-    batch.status = "reworking"
+    if batch.status != "reworking":
+        batch.status = "reworking"
+
     db.commit()
     db.refresh(rework)
 
     return schemas.ApiResponse(
-        message="返工记录已创建",
+        message=f"第{rework_no}次返工已发起，责任人为{responsible.name}",
         data=schemas.ReworkRecord.model_validate(rework).model_dump()
     )
 
@@ -151,8 +193,10 @@ def start_rework(
     if not rework:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    if rework.status != "pending":
-        raise HTTPException(status_code=400, detail="当前状态不允许开始返工")
+    _ensure_transition(rework.status, "processing")
+
+    if current_user.role != "admin" and rework.responsible_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只有该返工单的责任人才能开始处理")
 
     rework.status = "processing"
     db.commit()
@@ -171,8 +215,13 @@ def submit_rework_for_inspection(
     if not rework:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    if rework.status not in ["processing", "pending"]:
-        raise HTTPException(status_code=400, detail="当前状态不允许提交复检")
+    _ensure_transition(rework.status, "waiting_inspection")
+
+    if current_user.role != "admin" and rework.responsible_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只有该返工单的责任人才能提交复检")
+
+    if not rework_in.rework_result or not rework_in.rework_result.strip():
+        raise HTTPException(status_code=400, detail="返工结果不能为空")
 
     rework.status = "waiting_inspection"
     rework.actual_finish_time = rework_in.actual_finish_time
@@ -195,8 +244,7 @@ def complete_rework(
     if not rework:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    if rework.status != "waiting_inspection":
-        raise HTTPException(status_code=400, detail="当前状态不允许完成返工")
+    _ensure_transition(rework.status, "completed")
 
     rework.status = "completed"
     db.commit()
@@ -204,7 +252,7 @@ def complete_rework(
     return schemas.ApiResponse(message="返工复检完成")
 
 
-@router.put("/{rework_id}/cancel", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
+@router.put("/{rework_id}/cancel", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_technician)])
 def cancel_rework(
     rework_id: int,
     current_user: models.User = Depends(auth.get_current_active_user),
@@ -214,10 +262,15 @@ def cancel_rework(
     if not rework:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    if rework.status in ["completed", "cancelled"]:
-        raise HTTPException(status_code=400, detail="当前状态不允许取消")
+    _ensure_transition(rework.status, "cancelled")
 
     rework.status = "cancelled"
     db.commit()
+
+    batch = rework.batch
+    remaining_active = _get_active_rework(db, batch.id)
+    if not remaining_active and batch.status == "reworking":
+        batch.status = "pending_inspect"
+        db.commit()
 
     return schemas.ApiResponse(message="返工记录已取消")

@@ -97,7 +97,7 @@
               </span>
             </template>
           </el-table-column>
-          <el-table-column prop="quality_conclusion" label="质检结论" show-overflow-tooltip />
+          <el-table-column prop="quality_conclusion" label="交付质量结论" show-overflow-tooltip />
           <el-table-column prop="delivery_remark" label="交付备注" show-overflow-tooltip />
           <el-table-column label="操作" width="120" fixed="right">
             <template #default="{ row }">
