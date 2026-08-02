@@ -32,17 +32,19 @@ def record_inspection(
     )
     db.add(record)
 
+    closed_rework_count = 0
     if record_in.is_pass:
         batch.status = "deliverable"
         batch.actual_end_date = record_in.inspect_time
         batch.review_status = "pending_review"
 
-        waiting_rework = db.query(models.ReworkRecord).filter(
+        waiting_reworks = db.query(models.ReworkRecord).filter(
             models.ReworkRecord.batch_id == batch_id,
             models.ReworkRecord.status == "waiting_inspection"
-        ).order_by(models.ReworkRecord.created_at.desc()).first()
-        if waiting_rework:
-            waiting_rework.status = "completed"
+        ).all()
+        for wr in waiting_reworks:
+            wr.status = "completed"
+            closed_rework_count += 1
     else:
         batch.status = "reworking"
         batch.review_status = "not_required"
@@ -50,5 +52,10 @@ def record_inspection(
     batch.inspector_id = current_user.id
     db.commit()
 
-    message = "质检通过，批次已进入可交付状态，待交付复核" if record_in.is_pass else "质检未通过，批次进入返工状态"
+    if record_in.is_pass:
+        message = "质检通过，批次已进入可交付状态，待交付复核"
+        if closed_rework_count > 0:
+            message += f"；已同步闭环 {closed_rework_count} 条待复检返工记录"
+    else:
+        message = "质检未通过，批次进入返工状态"
     return schemas.ApiResponse(message=message)

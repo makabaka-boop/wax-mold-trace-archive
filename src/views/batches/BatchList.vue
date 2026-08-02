@@ -126,7 +126,7 @@
           <el-input v-model="createForm.code" placeholder="请输入批次号" />
         </el-form-item>
         <el-form-item label="款式" prop="style_id">
-          <el-select v-model="createForm.style_id" placeholder="请选择款式" style="width: 100%;">
+          <el-select v-model="createForm.style_id" placeholder="请选择款式" style="width: 100%;" @change="handleStyleChange">
             <el-option v-for="style in styles" :key="style.id" :label="style.name" :value="style.id" />
           </el-select>
         </el-form-item>
@@ -141,19 +141,24 @@
           </el-select>
         </el-form-item>
         <el-form-item label="模具" prop="mold_id">
-          <el-select v-model="createForm.mold_id" placeholder="请选择模具" style="width: 100%;">
+          <el-select
+            v-model="createForm.mold_id"
+            placeholder="请选择模具"
+            style="width: 100%;"
+            :disabled="!createForm.style_id"
+          >
             <el-option
-              v-for="mold in molds"
+              v-for="mold in availableMolds"
               :key="mold.id"
-              :label="`${mold.code} - ${mold.name}`"
+              :label="`${mold.code} - ${mold.name}（${mold.max_cavities}穴）`"
               :value="mold.id"
             />
           </el-select>
         </el-form-item>
         <el-form-item label="台位" prop="station_id">
-          <el-select v-model="createForm.station_id" placeholder="请选择台位" style="width: 100%;">
+          <el-select v-model="createForm.station_id" placeholder="请选择浇注台" style="width: 100%;">
             <el-option
-              v-for="station in stations"
+              v-for="station in pourStations"
               :key="station.id"
               :label="`${station.code} - ${station.name}`"
               :value="station.id"
@@ -199,7 +204,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, RefreshRight } from '@element-plus/icons-vue'
@@ -229,6 +234,41 @@ const molds = ref<Mold[]>([])
 const stations = ref<Station[]>([])
 const technicians = ref<User[]>([])
 
+const availableMolds = computed(() => {
+  if (!createForm.style_id) return []
+  return molds.value.filter(m => m.style_id === createForm.style_id && m.status !== 'maintenance')
+})
+
+const pourStations = computed(() => {
+  return stations.value.filter(s => s.type === 'pour' && s.status !== 'disabled')
+})
+
+const selectedMold = computed(() => {
+  return molds.value.find(m => m.id === createForm.mold_id) || null
+})
+
+const handleStyleChange = () => {
+  createForm.mold_id = null
+}
+
+const validateEndDate = (_rule: any, value: string, callback: any) => {
+  if (value && createForm.planned_start_date && value < createForm.planned_start_date) {
+    callback(new Error('计划结束日期不能早于计划开始日期'))
+  } else {
+    callback()
+  }
+}
+
+const validateQuantity = (_rule: any, value: number, callback: any) => {
+  if (!value || value <= 0) {
+    callback(new Error('试制件数必须大于0'))
+  } else if (selectedMold.value && value > selectedMold.value.max_cavities) {
+    callback(new Error(`试制件数不能超过模具最大穴数（${selectedMold.value.max_cavities}）`))
+  } else {
+    callback()
+  }
+}
+
 const filterForm = reactive({
   style_id: null as number | null,
   status: null as string | null,
@@ -254,10 +294,16 @@ const createRules: FormRules = {
   style_id: [{ required: true, message: '请选择款式', trigger: 'change' }],
   wax_batch_id: [{ required: true, message: '请选择蜡料炉次', trigger: 'change' }],
   mold_id: [{ required: true, message: '请选择模具', trigger: 'change' }],
-  station_id: [{ required: true, message: '请选择台位', trigger: 'change' }],
+  station_id: [{ required: true, message: '请选择浇注台', trigger: 'change' }],
   planned_start_date: [{ required: true, message: '请选择计划开始日期', trigger: 'change' }],
-  planned_end_date: [{ required: true, message: '请选择计划结束日期', trigger: 'change' }],
-  quantity: [{ required: true, message: '请输入试制件数', trigger: 'blur' }]
+  planned_end_date: [
+    { required: true, message: '请选择计划结束日期', trigger: 'change' },
+    { validator: validateEndDate, trigger: 'change' }
+  ],
+  quantity: [
+    { required: true, message: '请输入试制件数', trigger: 'blur' },
+    { validator: validateQuantity, trigger: 'change' }
+  ]
 }
 
 const getWaxBatchCode = (id: number) => {

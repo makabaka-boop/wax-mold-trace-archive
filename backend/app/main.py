@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
 from .database import engine, Base
@@ -16,6 +19,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    message = exc.detail if isinstance(exc.detail, str) else "请求失败"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.status_code,
+            "message": message,
+            "data": None
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        loc = ".".join(str(x) for x in first.get("loc", []) if x not in ("body", "query", "path"))
+        msg = first.get("msg", "参数校验失败")
+        message = f"{loc}：{msg}" if loc else msg
+    else:
+        message = "参数校验失败"
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": 422,
+            "message": message,
+            "data": None
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": 500,
+            "message": "服务器内部错误",
+            "data": None
+        }
+    )
+
 
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(users.router, prefix=settings.API_V1_PREFIX)
@@ -34,12 +83,12 @@ app.include_router(reworks.router, prefix=settings.API_V1_PREFIX)
 
 @app.get("/")
 def root():
-    return {"message": "手作蜡模试制流程追踪与质检归档 API 运行正常"}
+    return {"code": 200, "message": "success", "data": {"service": "手作蜡模试制流程追踪与质检归档 API", "status": "running"}}
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {"code": 200, "message": "success", "data": {"status": "healthy"}}
 
 
 if __name__ == "__main__":
