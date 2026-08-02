@@ -265,6 +265,7 @@ const submitForm = reactive({
 const createRules: FormRules = {
   batch_id: [{ required: true, message: '请选择批次', trigger: 'change' }],
   rework_reason: [{ required: true, message: '请输入返工原因', trigger: 'blur' }],
+  handling_instruction: [{ required: true, message: '请输入处理说明', trigger: 'blur' }],
   responsible_id: [{ required: true, message: '请选择责任人', trigger: 'change' }]
 }
 

@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
 from .database import engine, Base
@@ -8,6 +11,31 @@ from .routers import auth, users, styles, wax_batches, molds, stations, inspecti
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="手作蜡模试制流程追踪与质检归档 API", version="1.0.0")
+
+
+# ============ 数据契约：所有接口（含错误）统一返回 ApiResponse{code,message,data} ============
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.status_code, "message": detail, "data": None},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    messages = []
+    for error in exc.errors():
+        loc = ".".join(str(x) for x in error["loc"] if x not in ("body", "query", "path"))
+        msg = error["msg"]
+        if msg.startswith("Value error, "):
+            msg = msg[len("Value error, "):]
+        messages.append(f"{loc}: {msg}" if loc else msg)
+    return JSONResponse(
+        status_code=422,
+        content={"code": 422, "message": "参数校验失败：" + "；".join(messages), "data": None},
+    )
 
 app.add_middleware(
     CORSMiddleware,

@@ -74,7 +74,12 @@ def get_summary(
         count = base_query.filter(models.Batch.status == s).count()
         status_counts[s] = count
 
-    from .warnings import get_all_warnings_internal
+    from .warnings import (
+        get_all_warnings_internal,
+        count_open_reworks,
+        count_overdue_reworks,
+        count_waiting_rework_inspections,
+    )
     warnings = get_all_warnings_internal(db)
 
     pending_review_count = base_query.filter(
@@ -82,19 +87,11 @@ def get_summary(
         models.Batch.review_status == "pending_review"
     ).count()
 
-    from datetime import datetime
-    now = datetime.now()
-    pending_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"])
-    ).count()
-    overdue_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"]),
-        models.ReworkRecord.expected_finish_time.isnot(None),
-        models.ReworkRecord.expected_finish_time < now
-    ).count()
-    waiting_rework_inspection_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status == "waiting_inspection"
-    ).count()
+    # 返工统计与批次筛选条件联动，保证与返工闭环列表在同一筛选条件下数量一致
+    filtered_batch_ids = [row[0] for row in base_query.with_entities(models.Batch.id).all()]
+    pending_rework_count = count_open_reworks(db, filtered_batch_ids)
+    overdue_rework_count = count_overdue_reworks(db, filtered_batch_ids)
+    waiting_rework_inspection_count = count_waiting_rework_inspections(db, filtered_batch_ids)
 
     summary = schemas.DashboardSummary(
         total_batches=total,
@@ -208,14 +205,16 @@ def get_pending_inspections(
 
     result = []
     now = datetime.now().date()
+    from .warnings import get_pending_inspect_since
     for batch in batches:
         cycle = db.query(models.InspectionCycle).filter(
             models.InspectionCycle.style_id == batch.style_id
         ).first()
 
         cycle_days = cycle.cycle_days if cycle else 7
-        days_since_created = (now - batch.created_at.date()).days
-        days_overdue = max(0, days_since_created - cycle_days)
+        # 与预警中心同口径：以进入待质检状态的时间为基准
+        days_since_pending = (now - get_pending_inspect_since(batch).date()).days
+        days_overdue = max(0, days_since_pending - cycle_days)
 
         result.append(schemas.PendingInspectionItem(
             id=batch.id,

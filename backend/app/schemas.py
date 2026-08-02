@@ -1,6 +1,11 @@
 from datetime import date, datetime
-from typing import Optional, List
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Literal
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+# ============ 数据契约：状态枚举（前后端唯一事实源，与数据库 CheckConstraint 保持一致） ============
+BatchStatus = Literal["pending_pour", "molding", "pending_inspect", "reworking", "deliverable", "delivered", "paused"]
+ReviewStatus = Literal["not_required", "pending_review", "reviewed"]
+ReworkStatus = Literal["pending", "processing", "waiting_inspection", "completed", "cancelled"]
 
 
 class ApiResponse(BaseModel):
@@ -178,8 +183,14 @@ class BatchBase(BaseModel):
     inspector_id: Optional[int] = None
     planned_start_date: date
     planned_end_date: date
-    quantity: int
+    quantity: int = Field(gt=0)
     remark: Optional[str] = None
+
+    @model_validator(mode="after")
+    def check_planned_dates(self):
+        if self.planned_start_date > self.planned_end_date:
+            raise ValueError("计划开始日期不能晚于计划结束日期")
+        return self
 
 
 class BatchCreate(BatchBase):
@@ -187,14 +198,14 @@ class BatchCreate(BatchBase):
 
 
 class BatchUpdateStatus(BaseModel):
-    status: str
+    status: BatchStatus
     remark: Optional[str] = None
 
 
 class Batch(BatchBase):
     id: int
-    status: str
-    review_status: str = "not_required"
+    status: BatchStatus
+    review_status: ReviewStatus = "not_required"
     actual_start_date: Optional[datetime] = None
     actual_end_date: Optional[datetime] = None
     created_at: datetime
@@ -240,11 +251,12 @@ class DeliveryArchiveBase(BaseModel):
 
 
 class DeliveryArchiveCreate(BaseModel):
+    """交付归档：质量结论以后端最新复核记录为准，前端传入的 quality_conclusion 仅作展示，不参与保存。"""
     delivery_time: datetime
     delivered_quantity: int
     receiver: str
     delivery_remark: Optional[str] = None
-    quality_conclusion: str
+    quality_conclusion: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -353,10 +365,14 @@ class BubbleRecordCreate(BaseModel):
     remark: Optional[str] = None
 
 
-class ReworkRecordCreate(BaseModel):
+class ProcessReworkRecordCreate(BaseModel):
+    """批次详情-返工完成工艺记录（/batches/{id}/rework 入口）。
+
+    rework_count 与返工闭环单 rework_no 语义统一，由后端按当前闭环单自动写入，
+    不接受前端传入，避免返工次数与闭环列表不对应。
+    """
     record_time: datetime
     rework_reason: str
-    rework_count: int
     remark: Optional[str] = None
 
 
@@ -456,7 +472,7 @@ class PendingDeliveryReviewItem(BaseModel):
 class ReworkRecordBase(BaseModel):
     batch_id: int
     rework_reason: str
-    handling_instruction: Optional[str] = None
+    handling_instruction: str
     responsible_id: int
     expected_finish_time: Optional[datetime] = None
 
@@ -480,7 +496,7 @@ class ReworkRecord(BaseModel):
     rework_no: int
     initiator_id: int
     responsible_id: int
-    status: str
+    status: ReworkStatus
     rework_reason: str
     handling_instruction: Optional[str] = None
     expected_finish_time: Optional[datetime] = None

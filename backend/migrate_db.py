@@ -70,6 +70,38 @@ def migrate():
             else:
                 print("rework_records 表已存在")
 
+            # delivery_reviews.batch_id 去除唯一约束：复核失败的历史记录需保留可追溯
+            result = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='delivery_reviews'"))
+            row = result.fetchone()
+            if row and row[0] and "UNIQUE" in row[0].upper():
+                conn.execute(text("""
+                    CREATE TABLE delivery_reviews_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        batch_id INTEGER NOT NULL,
+                        reviewer_id INTEGER NOT NULL,
+                        review_time DATETIME NOT NULL,
+                        delivered_quantity INTEGER NOT NULL,
+                        final_quality_conclusion VARCHAR(500) NOT NULL,
+                        is_pass BOOLEAN NOT NULL,
+                        exception_remark TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (batch_id) REFERENCES batches (id),
+                        FOREIGN KEY (reviewer_id) REFERENCES users (id)
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO delivery_reviews_new
+                    SELECT id, batch_id, reviewer_id, review_time, delivered_quantity,
+                           final_quality_conclusion, is_pass, exception_remark, created_at
+                    FROM delivery_reviews
+                """))
+                conn.execute(text("DROP TABLE delivery_reviews"))
+                conn.execute(text("ALTER TABLE delivery_reviews_new RENAME TO delivery_reviews"))
+                conn.commit()
+                print("已重建 delivery_reviews 表，去除 batch_id 唯一约束")
+            else:
+                print("delivery_reviews 表无需迁移")
+
         deliverable_batches = db.query(models.Batch).filter(
             models.Batch.status == "deliverable",
             models.Batch.review_status == "not_required"
