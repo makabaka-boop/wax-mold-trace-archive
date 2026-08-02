@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import Optional
 from datetime import date, datetime
 
@@ -152,6 +153,57 @@ def create_batch(batch_in: schemas.BatchCreate, db: Session = Depends(get_db)):
     existing = db.query(models.Batch).filter(models.Batch.code == batch_in.code).first()
     if existing:
         raise HTTPException(status_code=400, detail="批次编码已存在")
+
+    if batch_in.planned_start_date > batch_in.planned_end_date:
+        raise HTTPException(status_code=400, detail="计划开始日期不能晚于计划结束日期")
+
+    style = db.query(models.Style).filter(models.Style.id == batch_in.style_id).first()
+    if not style:
+        raise HTTPException(status_code=400, detail="所选款式不存在")
+
+    wax_batch = db.query(models.WaxBatch).filter(models.WaxBatch.id == batch_in.wax_batch_id).first()
+    if not wax_batch:
+        raise HTTPException(status_code=400, detail="所选蜡料炉次不存在")
+
+    mold = db.query(models.Mold).filter(models.Mold.id == batch_in.mold_id).first()
+    if not mold:
+        raise HTTPException(status_code=400, detail="所选模具不存在")
+
+    station = db.query(models.Station).filter(models.Station.id == batch_in.station_id).first()
+    if not station:
+        raise HTTPException(status_code=400, detail="所选台位不存在")
+
+    technician = db.query(models.User).filter(models.User.id == batch_in.technician_id).first()
+    if not technician:
+        raise HTTPException(status_code=400, detail="所选工艺员不存在")
+
+    if mold.style_id != batch_in.style_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模具款式（{mold.style.name}）与批次款式（{style.name}）不一致"
+        )
+
+    if batch_in.quantity > mold.max_cavities:
+        raise HTTPException(
+            status_code=400,
+            detail=f"试制数量（{batch_in.quantity}件）超过模具最大穴数（{mold.max_cavities}穴）"
+        )
+
+    if station.type != "pour":
+        raise HTTPException(
+            status_code=400,
+            detail="新建批次首工序为浇注，台位类型必须为浇注台"
+        )
+
+    allocated_qty = db.query(func.coalesce(func.sum(models.Batch.quantity), 0)).filter(
+        models.Batch.wax_batch_id == batch_in.wax_batch_id
+    ).scalar()
+    if allocated_qty + batch_in.quantity > wax_batch.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"蜡料炉次【{wax_batch.code}】可用数量不足：总库存 {wax_batch.quantity} 件，"
+                   f"已分配 {allocated_qty} 件，本次申请 {batch_in.quantity} 件"
+        )
 
     if not check_mold_availability(db, batch_in.mold_id, batch_in.planned_start_date, batch_in.planned_end_date):
         raise HTTPException(status_code=400, detail="该模具在计划时间段内已有安排，请调整时间或更换模具")
@@ -311,7 +363,7 @@ def record_bubble(
 @router.post("/{batch_id}/rework", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_technician)])
 def record_rework(
     batch_id: int,
-    record_in: schemas.ReworkRecordCreate,
+    record_in: schemas.BatchReworkCreate,
     current_user: models.User = Depends(auth.get_current_active_user),
     db: Session = Depends(get_db)
 ):
@@ -320,7 +372,21 @@ def record_rework(
         raise HTTPException(status_code=404, detail="批次不存在")
 
     if batch.status != "reworking":
-        raise HTTPException(status_code=400, detail="当前状态不允许提交返工申请")
+        raise HTTPException(status_code=400, detail="当前状态不允许提交返工记录")
+
+    active_rework = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.batch_id == batch_id,
+        models.ReworkRecord.status.in_(["pending", "processing"])
+    ).order_by(models.ReworkRecord.created_at.desc()).first()
+
+    if not active_rework:
+        raise HTTPException(
+            status_code=400,
+            detail="未找到进行中的返工闭环记录，请先在返工闭环中发起返工"
+        )
+
+    if active_rework.status == "pending":
+        active_rework.status = "processing"
 
     record = models.ProcessRecord(
         batch_id=batch_id,
@@ -333,10 +399,14 @@ def record_rework(
     )
     db.add(record)
 
+    active_rework.status = "waiting_inspection"
+    active_rework.actual_finish_time = record_in.record_time
+    active_rework.rework_result = record_in.rework_reason
+
     batch.status = "pending_inspect"
     db.commit()
 
-    return schemas.ApiResponse(message="返工完成，批次重新进入待质检状态")
+    return schemas.ApiResponse(message="返工完成，已提交复检，批次重新进入待质检状态")
 
 
 @router.post("/{batch_id}/delivery-review", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_inspector)])
@@ -369,20 +439,46 @@ def record_delivery_review(
         db.delete(existing_review)
         db.flush()
 
+    if not record_in.is_pass:
+        batch.review_status = "not_required"
+        batch.status = "reworking"
+
+        active_rework = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id == batch_id,
+            models.ReworkRecord.status.in_(["pending", "processing", "waiting_inspection"])
+        ).first()
+        if not active_rework:
+            last_rework = db.query(models.ReworkRecord).filter(
+                models.ReworkRecord.batch_id == batch_id
+            ).order_by(models.ReworkRecord.rework_no.desc()).first()
+            rework_no = (last_rework.rework_no + 1) if last_rework else 1
+
+            reason = record_in.exception_remark or record_in.final_quality_conclusion or "交付复核未通过"
+            new_rework = models.ReworkRecord(
+                batch_id=batch_id,
+                rework_no=rework_no,
+                initiator_id=current_user.id,
+                responsible_id=batch.technician_id,
+                status="pending",
+                rework_reason=f"交付复核不通过：{reason}"
+            )
+            db.add(new_rework)
+
+        db.commit()
+        return schemas.ApiResponse(message="交付复核未通过，批次已退回返工")
+
     review = models.DeliveryReview(
         batch_id=batch_id,
         reviewer_id=current_user.id,
         review_time=record_in.review_time,
         delivered_quantity=record_in.delivered_quantity,
         final_quality_conclusion=record_in.final_quality_conclusion,
-        is_pass=record_in.is_pass,
+        is_pass=True,
         exception_remark=record_in.exception_remark
     )
     db.add(review)
 
     batch.review_status = "reviewed"
-    if not record_in.is_pass:
-        batch.status = "reworking"
     db.commit()
 
     return schemas.ApiResponse(message="交付复核完成")
@@ -426,13 +522,11 @@ def record_delivery_archive(
     if record_in.delivered_quantity <= 0:
         raise HTTPException(status_code=400, detail="交付件数必须大于0")
 
-    if record_in.delivered_quantity > batch.quantity:
-        raise HTTPException(status_code=400, detail="交付件数不能超过试制件数")
-
-    latest_inspection = None
-    if batch.inspection_records:
-        latest_inspection = max(batch.inspection_records, key=lambda x: x.inspect_time)
-    quality_conclusion = latest_inspection.opinion if latest_inspection else "无质检记录"
+    if record_in.delivered_quantity > batch.delivery_review.delivered_quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"交付件数不能超过复核通过件数（{batch.delivery_review.delivered_quantity}件）"
+        )
 
     archive = models.DeliveryArchive(
         batch_id=batch_id,
@@ -441,7 +535,7 @@ def record_delivery_archive(
         delivered_quantity=record_in.delivered_quantity,
         receiver=record_in.receiver,
         delivery_remark=record_in.delivery_remark,
-        quality_conclusion=quality_conclusion
+        quality_conclusion=record_in.quality_conclusion
     )
     db.add(archive)
 

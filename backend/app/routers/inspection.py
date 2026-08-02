@@ -37,18 +37,46 @@ def record_inspection(
         batch.actual_end_date = record_in.inspect_time
         batch.review_status = "pending_review"
 
-        waiting_rework = db.query(models.ReworkRecord).filter(
+        waiting_reworks = db.query(models.ReworkRecord).filter(
             models.ReworkRecord.batch_id == batch_id,
             models.ReworkRecord.status == "waiting_inspection"
-        ).order_by(models.ReworkRecord.created_at.desc()).first()
-        if waiting_rework:
-            waiting_rework.status = "completed"
+        ).all()
+        for wr in waiting_reworks:
+            wr.status = "completed"
     else:
         batch.status = "reworking"
         batch.review_status = "not_required"
 
+        existing_waiting = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id == batch_id,
+            models.ReworkRecord.status == "waiting_inspection"
+        ).order_by(models.ReworkRecord.created_at.desc()).first()
+
+        if existing_waiting:
+            existing_waiting.status = "processing"
+        else:
+            active_rework = db.query(models.ReworkRecord).filter(
+                models.ReworkRecord.batch_id == batch_id,
+                models.ReworkRecord.status.in_(["pending", "processing"])
+            ).first()
+            if not active_rework:
+                last_rework = db.query(models.ReworkRecord).filter(
+                    models.ReworkRecord.batch_id == batch_id
+                ).order_by(models.ReworkRecord.rework_no.desc()).first()
+                rework_no = (last_rework.rework_no + 1) if last_rework else 1
+
+                new_rework = models.ReworkRecord(
+                    batch_id=batch_id,
+                    rework_no=rework_no,
+                    initiator_id=current_user.id,
+                    responsible_id=batch.technician_id,
+                    status="pending",
+                    rework_reason=f"质检不通过：{record_in.opinion}"
+                )
+                db.add(new_rework)
+
     batch.inspector_id = current_user.id
     db.commit()
 
-    message = "质检通过，批次已进入可交付状态，待交付复核" if record_in.is_pass else "质检未通过，批次进入返工状态"
+    message = "质检通过，批次已进入可交付状态，待交付复核" if record_in.is_pass else "质检未通过，批次进入返工状态，已自动创建返工闭环记录"
     return schemas.ApiResponse(message=message)

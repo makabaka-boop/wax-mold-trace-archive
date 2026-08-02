@@ -1,6 +1,17 @@
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field, ConfigDict
+
+
+BatchStatus = Literal[
+    "pending_pour", "molding", "pending_inspect",
+    "reworking", "deliverable", "delivered", "paused"
+]
+ReviewStatus = Literal["not_required", "pending_review", "reviewed"]
+ReworkStatus = Literal[
+    "pending", "processing", "waiting_inspection",
+    "completed", "cancelled"
+]
 
 
 class ApiResponse(BaseModel):
@@ -178,7 +189,7 @@ class BatchBase(BaseModel):
     inspector_id: Optional[int] = None
     planned_start_date: date
     planned_end_date: date
-    quantity: int
+    quantity: int = Field(ge=1)
     remark: Optional[str] = None
 
 
@@ -187,14 +198,14 @@ class BatchCreate(BatchBase):
 
 
 class BatchUpdateStatus(BaseModel):
-    status: str
+    status: BatchStatus
     remark: Optional[str] = None
 
 
 class Batch(BatchBase):
     id: int
-    status: str
-    review_status: str = "not_required"
+    status: BatchStatus
+    review_status: ReviewStatus = "not_required"
     actual_start_date: Optional[datetime] = None
     actual_end_date: Optional[datetime] = None
     created_at: datetime
@@ -353,7 +364,7 @@ class BubbleRecordCreate(BaseModel):
     remark: Optional[str] = None
 
 
-class ReworkRecordCreate(BaseModel):
+class BatchReworkCreate(BaseModel):
     record_time: datetime
     rework_reason: str
     rework_count: int
@@ -480,7 +491,7 @@ class ReworkRecord(BaseModel):
     rework_no: int
     initiator_id: int
     responsible_id: int
-    status: str
+    status: ReworkStatus
     rework_reason: str
     handling_instruction: Optional[str] = None
     expected_finish_time: Optional[datetime] = None
