@@ -193,7 +193,7 @@
                 <div v-if="record.bubble_description">气泡描述：{{ record.bubble_description }}</div>
                 <div v-if="record.bubble_count !== null">气泡点数：{{ record.bubble_count }} 个</div>
                 <div v-if="record.rework_reason">返工原因：{{ record.rework_reason }}</div>
-                <div v-if="record.rework_count !== null">返工件数：{{ record.rework_count }} 件</div>
+                <div v-if="record.rework_count !== null">返工次数：第 {{ record.rework_count }} 次</div>
                 <div v-if="record.remark">备注：{{ record.remark }}</div>
               </div>
             </div>
@@ -588,10 +588,6 @@
             placeholder="请输入返工原因"
           />
         </el-form-item>
-        <el-form-item label="返工件数" prop="rework_count">
-          <el-input-number v-model="reworkForm.rework_count" :min="1" :max="10000" style="width: 100%;" />
-          <span style="color: #94a3b8; font-size: 12px;">单位：件</span>
-        </el-form-item>
         <el-form-item label="备注" prop="remark">
           <el-input
             v-model="reworkForm.remark"
@@ -742,11 +738,11 @@
           <el-input-number
             v-model="deliveryArchiveForm.delivered_quantity"
             :min="1"
-            :max="batchDetail?.quantity || 10000"
+            :max="batchDetail?.delivery_review?.delivered_quantity || batchDetail?.quantity || 10000"
             style="width: 100%;"
           />
           <span style="color: #94a3b8; font-size: 12px;">
-            批次试制件数：{{ batchDetail?.quantity || '-' }} 件，交付件数不能超过试制件数
+            复核通过件数：{{ batchDetail?.delivery_review?.delivered_quantity ?? '-' }} 件，归档件数不能超过复核通过件数
           </span>
         </el-form-item>
         <el-form-item label="接收方" prop="receiver">
@@ -755,16 +751,16 @@
             placeholder="请输入接收方"
           />
         </el-form-item>
-        <el-form-item label="关联质检结论" prop="quality_conclusion">
+        <el-form-item label="关联复核结论" prop="quality_conclusion">
           <el-input
             v-model="deliveryArchiveForm.quality_conclusion"
             type="textarea"
             :rows="3"
-            placeholder="自动关联最新质检结论"
+            placeholder="自动关联交付复核的最终质量结论"
             disabled
           />
           <span style="color: #94a3b8; font-size: 12px;">
-            系统自动关联最新质检结论，不可修改
+            系统自动关联交付复核的最终质量结论，不可修改
           </span>
         </el-form-item>
         <el-form-item label="交付备注" prop="delivery_remark">
@@ -911,7 +907,6 @@ const bubbleForm = reactive({
 const reworkForm = reactive({
   record_time: now,
   rework_reason: '',
-  rework_count: null as number | null,
   remark: ''
 })
 
@@ -973,8 +968,7 @@ const bubbleRules: FormRules = {
 
 const reworkRules: FormRules = {
   record_time: [{ required: true, message: '请选择返工时间', trigger: 'change' }],
-  rework_reason: [{ required: true, message: '请输入返工原因', trigger: 'blur' }],
-  rework_count: [{ required: true, message: '请输入返工件数', trigger: 'blur' }]
+  rework_reason: [{ required: true, message: '请输入返工原因', trigger: 'blur' }]
 }
 
 const inspectRules: FormRules = {
@@ -1010,21 +1004,31 @@ const deliveryArchiveRules: FormRules = {
     { required: true, message: '请输入交付件数', trigger: 'blur' },
     {
       validator: (_rule, value, callback) => {
-        if (value !== null && value !== undefined && batchDetail.value && value > batchDetail.value.quantity) {
-          callback(new Error('交付件数不能超过试制件数'))
-        } else {
+        if (value === null || value === undefined || !batchDetail.value) {
           callback()
+          return
         }
+        if (value > batchDetail.value.quantity) {
+          callback(new Error('交付件数不能超过试制件数'))
+          return
+        }
+        const reviewedQty = batchDetail.value.delivery_review?.delivered_quantity
+        if (reviewedQty && value > reviewedQty) {
+          callback(new Error(`交付件数不能超过复核通过件数（${reviewedQty}件）`))
+          return
+        }
+        callback()
       },
       trigger: 'blur'
     }
   ],
   receiver: [{ required: true, message: '请输入接收方', trigger: 'blur' }],
-  quality_conclusion: [{ required: true, message: '请输入关联质检结论', trigger: 'blur' }]
+  quality_conclusion: [{ required: true, message: '请输入关联复核结论', trigger: 'blur' }]
 }
 
 const initiateReworkRules: FormRules = {
   rework_reason: [{ required: true, message: '请输入返工原因', trigger: 'blur' }],
+  handling_instruction: [{ required: true, message: '请输入处理说明', trigger: 'blur' }],
   responsible_id: [{ required: true, message: '请选择责任人', trigger: 'change' }]
 }
 
@@ -1209,7 +1213,6 @@ const openBubbleDialog = () => {
 const openReworkDialog = () => {
   reworkForm.record_time = new Date().toISOString().slice(0, 19).replace('T', ' ')
   reworkForm.rework_reason = ''
-  reworkForm.rework_count = null
   reworkForm.remark = ''
   reworkFormRef.value?.resetFields()
   reworkDialogVisible.value = true
@@ -1240,17 +1243,7 @@ const openDeliveryArchiveDialog = () => {
   deliveryArchiveForm.delivery_time = new Date().toISOString().slice(0, 19).replace('T', ' ')
   deliveryArchiveForm.delivered_quantity = batchDetail.value?.delivery_review?.delivered_quantity ?? batchDetail.value?.quantity ?? null
   deliveryArchiveForm.receiver = ''
-  
-  const inspectionRecords = batchDetail.value?.inspection_records || []
-  if (inspectionRecords.length > 0) {
-    const sorted = [...inspectionRecords].sort(
-      (a, b) => new Date(b.inspect_time).getTime() - new Date(a.inspect_time).getTime()
-    )
-    deliveryArchiveForm.quality_conclusion = sorted[0].opinion || '无质检结论'
-  } else {
-    deliveryArchiveForm.quality_conclusion = '无质检记录'
-  }
-  
+  deliveryArchiveForm.quality_conclusion = batchDetail.value?.delivery_review?.final_quality_conclusion || '无复核结论'
   deliveryArchiveForm.delivery_remark = ''
   deliveryArchiveDialogVisible.value = true
 }

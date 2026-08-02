@@ -29,7 +29,7 @@ REWORK_STATUS_COLOR_MAP = {
 @router.get("", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
 def get_rework_records(
     batch_id: Optional[int] = Query(None),
-    status: Optional[str] = Query(None),
+    status: Optional[schemas.ReworkStatus] = Query(None),
     responsible_id: Optional[int] = Query(None),
     keyword: Optional[str] = Query(None),
     db: Session = Depends(get_db)
@@ -63,29 +63,13 @@ def get_rework_records(
 
 @router.get("/stats", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
 def get_rework_stats(db: Session = Depends(get_db)):
-    now = datetime.now()
-
-    pending_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"])
-    ).count()
-
-    overdue_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"]),
-        models.ReworkRecord.expected_finish_time.isnot(None),
-        models.ReworkRecord.expected_finish_time < now
-    ).count()
-
-    waiting_inspection_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status == "waiting_inspection"
-    ).count()
-
-    total_count = db.query(models.ReworkRecord).count()
+    from .warnings import count_open_reworks, count_overdue_reworks, count_waiting_rework_inspections
 
     stats = schemas.ReworkStats(
-        pending_rework=pending_count,
-        overdue_rework=overdue_count,
-        waiting_inspection=waiting_inspection_count,
-        total_rework=total_count
+        pending_rework=count_open_reworks(db),
+        overdue_rework=count_overdue_reworks(db),
+        waiting_inspection=count_waiting_rework_inspections(db),
+        total_rework=db.query(models.ReworkRecord).count()
     )
 
     return schemas.ApiResponse(data=stats.model_dump())
@@ -117,6 +101,21 @@ def create_rework(
     batch = db.query(models.Batch).filter(models.Batch.id == rework_in.batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
+
+    if batch.status not in ["reworking", "pending_inspect"]:
+        raise HTTPException(status_code=400, detail="当前批次状态不允许发起返工")
+
+    responsible = db.query(models.User).filter(models.User.id == rework_in.responsible_id).first()
+    if not responsible:
+        raise HTTPException(status_code=400, detail="所选责任人不存在")
+
+    open_statuses = ["pending", "processing", "waiting_inspection"]
+    existing_open = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.batch_id == rework_in.batch_id,
+        models.ReworkRecord.status.in_(open_statuses)
+    ).first()
+    if existing_open:
+        raise HTTPException(status_code=400, detail=f"该批次已有未闭环的返工记录（第{existing_open.rework_no}次返工），请先完成或取消")
 
     last_rework = db.query(models.ReworkRecord).filter(
         models.ReworkRecord.batch_id == rework_in.batch_id
@@ -171,8 +170,8 @@ def submit_rework_for_inspection(
     if not rework:
         raise HTTPException(status_code=404, detail="返工记录不存在")
 
-    if rework.status not in ["processing", "pending"]:
-        raise HTTPException(status_code=400, detail="当前状态不允许提交复检")
+    if rework.status != "processing":
+        raise HTTPException(status_code=400, detail="当前状态不允许提交复检，请先开始返工处理")
 
     rework.status = "waiting_inspection"
     rework.actual_finish_time = rework_in.actual_finish_time

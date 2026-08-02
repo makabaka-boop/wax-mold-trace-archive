@@ -37,15 +37,27 @@ def record_inspection(
         batch.actual_end_date = record_in.inspect_time
         batch.review_status = "pending_review"
 
-        waiting_rework = db.query(models.ReworkRecord).filter(
+        # 复检通过即代表本批次返工全部有效，关闭所有未闭环返工单，
+        # 避免历史遗留单继续影响预警与统计
+        open_reworks = db.query(models.ReworkRecord).filter(
             models.ReworkRecord.batch_id == batch_id,
-            models.ReworkRecord.status == "waiting_inspection"
-        ).order_by(models.ReworkRecord.created_at.desc()).first()
-        if waiting_rework:
-            waiting_rework.status = "completed"
+            models.ReworkRecord.status.in_(["pending", "processing", "waiting_inspection"])
+        ).all()
+        for rework in open_reworks:
+            rework.status = "completed"
+            if not rework.actual_finish_time:
+                rework.actual_finish_time = record_in.inspect_time
     else:
         batch.status = "reworking"
         batch.review_status = "not_required"
+        # 复检不通过：待复检单退回处理中，由同一闭环单继续返工直至通过，
+        # 避免悬挂的待复检单阻塞后续返工流程
+        waiting_reworks = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id == batch_id,
+            models.ReworkRecord.status == "waiting_inspection"
+        ).all()
+        for rework in waiting_reworks:
+            rework.status = "processing"
 
     batch.inspector_id = current_user.id
     db.commit()

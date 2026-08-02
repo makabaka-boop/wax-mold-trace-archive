@@ -9,6 +9,57 @@ from .. import models, schemas, auth
 router = APIRouter(prefix="/warnings", tags=["预警中心"])
 
 
+# ============ 统一统计口径（仪表盘 / 预警中心 / 返工闭环共用，保证同一条件下数量一致） ============
+
+def get_pending_inspect_since(batch) -> datetime:
+    """批次最近一次进入待质检(pending_inspect)状态的时间。
+
+    进入路径：修边完成、返工完成工艺记录、返工闭环提交复检；
+    均无记录时回退为批次创建时间。
+    """
+    candidates = [
+        pr.record_time for pr in batch.process_records
+        if pr.type in ("trim", "rework") and pr.record_time is not None
+    ]
+    candidates += [
+        rw.actual_finish_time for rw in batch.rework_records
+        if rw.actual_finish_time is not None
+    ]
+    return max(candidates) if candidates else batch.created_at
+
+
+def count_open_reworks(db: Session, batch_ids=None) -> int:
+    """未闭环返工（pending+processing）数量，与返工闭环列表同口径"""
+    query = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.status.in_(["pending", "processing"])
+    )
+    if batch_ids is not None:
+        query = query.filter(models.ReworkRecord.batch_id.in_(batch_ids))
+    return query.count()
+
+
+def count_overdue_reworks(db: Session, batch_ids=None) -> int:
+    """超期返工数量：pending/processing 且预计完成时间早于当前时刻（与返工超期预警同口径）"""
+    query = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.status.in_(["pending", "processing"]),
+        models.ReworkRecord.expected_finish_time.isnot(None),
+        models.ReworkRecord.expected_finish_time < datetime.now()
+    )
+    if batch_ids is not None:
+        query = query.filter(models.ReworkRecord.batch_id.in_(batch_ids))
+    return query.count()
+
+
+def count_waiting_rework_inspections(db: Session, batch_ids=None) -> int:
+    """待复检返工（waiting_inspection）数量"""
+    query = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.status == "waiting_inspection"
+    )
+    if batch_ids is not None:
+        query = query.filter(models.ReworkRecord.batch_id.in_(batch_ids))
+    return query.count()
+
+
 def get_all_warnings_internal(db: Session) -> list:
     warnings = []
 
@@ -111,7 +162,9 @@ def check_overdue_inspection(db: Session) -> list:
         ).first()
 
         cycle_days = cycle.cycle_days if cycle else 7
-        days_since = (now - batch.created_at.date()).days
+        # 以批次最近一次进入待质检状态的时间为基准，而非批次创建时间
+        since = get_pending_inspect_since(batch).date()
+        days_since = (now - since).days
 
         if days_since > cycle_days:
             overdue_days = days_since - cycle_days
@@ -119,7 +172,7 @@ def check_overdue_inspection(db: Session) -> list:
                 type="overdue_inspection",
                 level="high" if overdue_days >= 3 else "medium",
                 title=f"批次【{batch.code}】质检超期",
-                content=f"已超期 {overdue_days} 天，质检周期为 {cycle_days} 天",
+                content=f"进入待质检已超期 {overdue_days} 天，质检周期为 {cycle_days} 天",
                 related_id=batch.id,
                 related_type="batch",
                 created_at=datetime.now()
@@ -129,32 +182,28 @@ def check_overdue_inspection(db: Session) -> list:
 
 
 def check_rework_no_conclusion(db: Session) -> list:
+    """返工处理中但迟迟未提交复检，以返工闭环单状态为准（不看工艺记录）"""
     warnings = []
     threshold_days = 3
-    now = datetime.now().date()
+    now = datetime.now()
 
-    rework_batches = db.query(models.Batch).filter(
-        models.Batch.status == "reworking"
+    processing_reworks = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.status == "processing"
     ).all()
 
-    for batch in rework_batches:
-        last_rework = db.query(models.ProcessRecord).filter(
-            models.ProcessRecord.batch_id == batch.id,
-            models.ProcessRecord.type == "rework"
-        ).order_by(models.ProcessRecord.record_time.desc()).first()
-
-        if last_rework:
-            days_since = (now - last_rework.record_time.date()).days
-            if days_since > threshold_days:
-                warnings.append(schemas.WarningItem(
-                    type="rework_no_conclusion",
-                    level="high" if days_since >= 7 else "medium",
-                    title=f"批次【{batch.code}】返工后无结论",
-                    content=f"返工已 {days_since} 天未提交质检结论，超过阈值 {threshold_days} 天",
-                    related_id=batch.id,
-                    related_type="batch",
-                    created_at=datetime.now()
-                ).model_dump())
+    for rework in processing_reworks:
+        base_time = rework.updated_at or rework.created_at
+        days_since = (now - base_time).days
+        if days_since > threshold_days:
+            warnings.append(schemas.WarningItem(
+                type="rework_no_conclusion",
+                level="high" if days_since >= 7 else "medium",
+                title=f"批次【{rework.batch.code}】返工处理无结论",
+                content=f"第 {rework.rework_no} 次返工已处理 {days_since} 天未提交复检，超过阈值 {threshold_days} 天",
+                related_id=rework.batch_id,
+                related_type="batch",
+                created_at=datetime.now()
+            ).model_dump())
 
     return warnings
 
@@ -167,22 +216,23 @@ def check_pass_rate_drop(db: Session) -> list:
     styles = db.query(models.Style).all()
 
     for style in styles:
-        all_inspected = db.query(models.Batch).join(
-            models.InspectionRecord, models.Batch.id == models.InspectionRecord.batch_id
-        ).filter(
-            models.Batch.style_id == style.id
-        ).order_by(
-            models.InspectionRecord.inspect_time.desc()
-        ).all()
+        # 每个批次只取其最新一条质检记录，按质检时间倒序取样
+        latest_records = []
+        batches = db.query(models.Batch).filter(models.Batch.style_id == style.id).all()
+        for batch in batches:
+            if batch.inspection_records:
+                latest = max(batch.inspection_records, key=lambda ir: (ir.inspect_time, ir.id))
+                latest_records.append(latest)
 
-        if len(all_inspected) < min_batches * 2:
+        if len(latest_records) < min_batches * 2:
             continue
 
-        recent = all_inspected[:min_batches]
-        earlier = all_inspected[min_batches:min_batches * 2]
+        latest_records.sort(key=lambda ir: (ir.inspect_time, ir.id), reverse=True)
+        recent = latest_records[:min_batches]
+        earlier = latest_records[min_batches:min_batches * 2]
 
-        recent_pass = sum(1 for b in recent if any(ir.is_pass for ir in b.inspection_records))
-        earlier_pass = sum(1 for b in earlier if any(ir.is_pass for ir in b.inspection_records))
+        recent_pass = sum(1 for ir in recent if ir.is_pass)
+        earlier_pass = sum(1 for ir in earlier if ir.is_pass)
 
         recent_rate = recent_pass / len(recent)
         earlier_rate = earlier_pass / len(earlier)
@@ -240,6 +290,7 @@ def get_unreviewed_delivery_warnings(db: Session = Depends(get_db)):
 
 
 def check_rework_overdue(db: Session) -> list:
+    """返工超期：与仪表盘 overdue_rework、返工闭环统计完全同口径（expected_finish_time < 当前时刻）"""
     warnings = []
     now = datetime.now()
 
@@ -251,21 +302,22 @@ def check_rework_overdue(db: Session) -> list:
 
     for rework in overdue_reworks:
         overdue_days = (now - rework.expected_finish_time).days
-        if overdue_days > 0:
-            warnings.append(schemas.WarningItem(
-                type="rework_overdue",
-                level="high" if overdue_days >= 3 else "medium",
-                title=f"批次【{rework.batch.code}】返工超期",
-                content=f"第 {rework.rework_no} 次返工已超期 {overdue_days} 天，责任人：{rework.responsible.name}",
-                related_id=rework.batch_id,
-                related_type="batch",
-                created_at=datetime.now()
-            ).model_dump())
+        overdue_text = f"{overdue_days} 天" if overdue_days > 0 else "不足 1 天"
+        warnings.append(schemas.WarningItem(
+            type="rework_overdue",
+            level="high" if overdue_days >= 3 else "medium",
+            title=f"批次【{rework.batch.code}】返工超期",
+            content=f"第 {rework.rework_no} 次返工已超期 {overdue_text}，责任人：{rework.responsible.name}",
+            related_id=rework.batch_id,
+            related_type="batch",
+            created_at=datetime.now()
+        ).model_dump())
 
     return warnings
 
 
 def check_multiple_reworks(db: Session) -> list:
+    """多次返工：只统计有效返工（排除已取消记录）"""
     warnings = []
     threshold = 2
 
@@ -275,6 +327,8 @@ def check_multiple_reworks(db: Session) -> list:
         func.count(models.ReworkRecord.id).label("rework_count")
     ).join(
         models.Batch, models.ReworkRecord.batch_id == models.Batch.id
+    ).filter(
+        models.ReworkRecord.status != "cancelled"
     ).group_by(
         models.ReworkRecord.batch_id, models.Batch.code
     ).having(
