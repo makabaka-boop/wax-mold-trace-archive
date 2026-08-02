@@ -70,6 +70,44 @@ def migrate():
             else:
                 print("rework_records 表已存在")
 
+            # 复核记录改为只增不删：去除 delivery_reviews.batch_id 的 UNIQUE 约束
+            result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_reviews'"))
+            if result.fetchone() is not None:
+                ddl_row = conn.execute(text(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='delivery_reviews'"
+                )).fetchone()
+                ddl = ddl_row[0] if ddl_row else ""
+                if "UNIQUE" in ddl.upper():
+                    conn.execute(text("ALTER TABLE delivery_reviews RENAME TO delivery_reviews_old"))
+                    conn.execute(text("""
+                        CREATE TABLE delivery_reviews (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            batch_id INTEGER NOT NULL,
+                            reviewer_id INTEGER NOT NULL,
+                            review_time DATETIME NOT NULL,
+                            delivered_quantity INTEGER NOT NULL,
+                            final_quality_conclusion VARCHAR(500) NOT NULL,
+                            is_pass BOOLEAN NOT NULL,
+                            exception_remark TEXT,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (batch_id) REFERENCES batches (id),
+                            FOREIGN KEY (reviewer_id) REFERENCES users (id)
+                        )
+                    """))
+                    conn.execute(text("""
+                        INSERT INTO delivery_reviews
+                            (id, batch_id, reviewer_id, review_time, delivered_quantity,
+                             final_quality_conclusion, is_pass, exception_remark, created_at)
+                        SELECT id, batch_id, reviewer_id, review_time, delivered_quantity,
+                               final_quality_conclusion, is_pass, exception_remark, created_at
+                        FROM delivery_reviews_old
+                    """))
+                    conn.execute(text("DROP TABLE delivery_reviews_old"))
+                    conn.commit()
+                    print("已去除 delivery_reviews.batch_id 的唯一约束（改为只增不删）")
+                else:
+                    print("delivery_reviews.batch_id 唯一约束已移除")
+
         deliverable_batches = db.query(models.Batch).filter(
             models.Batch.status == "deliverable",
             models.Batch.review_status == "not_required"
