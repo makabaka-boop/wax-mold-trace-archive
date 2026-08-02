@@ -57,7 +57,7 @@ def _apply_batch_filters(query, style_id=None, status=None, technician_id=None,
 @router.get("/summary", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
 def get_summary(
     style_id: Optional[int] = Query(None),
-    status: Optional[str] = Query(None),
+    status: Optional[schemas.BatchStatus] = Query(None),
     technician_id: Optional[int] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
@@ -84,16 +84,15 @@ def get_summary(
 
     from datetime import datetime
     now = datetime.now()
+    from .reworks import rework_pending_filter, rework_overdue_filter, rework_waiting_inspection_filter
     pending_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"])
+        rework_pending_filter()
     ).count()
     overdue_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"]),
-        models.ReworkRecord.expected_finish_time.isnot(None),
-        models.ReworkRecord.expected_finish_time < now
+        rework_overdue_filter(now)
     ).count()
     waiting_rework_inspection_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status == "waiting_inspection"
+        rework_waiting_inspection_filter()
     ).count()
 
     summary = schemas.DashboardSummary(
@@ -144,7 +143,7 @@ def get_batch_progress(
 @router.get("/station-load", response_model=schemas.ApiResponse, dependencies=[Depends(auth.allow_all)])
 def get_station_load(
     style_id: Optional[int] = Query(None),
-    status: Optional[str] = Query(None),
+    status: Optional[schemas.BatchStatus] = Query(None),
     technician_id: Optional[int] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
@@ -208,14 +207,15 @@ def get_pending_inspections(
 
     result = []
     now = datetime.now().date()
+    from .warnings import get_pending_inspect_since
     for batch in batches:
         cycle = db.query(models.InspectionCycle).filter(
             models.InspectionCycle.style_id == batch.style_id
         ).first()
 
         cycle_days = cycle.cycle_days if cycle else 7
-        days_since_created = (now - batch.created_at.date()).days
-        days_overdue = max(0, days_since_created - cycle_days)
+        days_since = (now - get_pending_inspect_since(db, batch)).days
+        days_overdue = max(0, days_since - cycle_days)
 
         result.append(schemas.PendingInspectionItem(
             id=batch.id,

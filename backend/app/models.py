@@ -135,9 +135,19 @@ class Batch(Base):
     inspector = relationship("User", foreign_keys=[inspector_id], back_populates="inspector_batches")
     process_records = relationship("ProcessRecord", back_populates="batch", cascade="all, delete-orphan")
     inspection_records = relationship("InspectionRecord", back_populates="batch", cascade="all, delete-orphan")
-    delivery_review = relationship("DeliveryReview", back_populates="batch", uselist=False, cascade="all, delete-orphan")
+    delivery_reviews = relationship(
+        "DeliveryReview",
+        back_populates="batch",
+        cascade="all, delete-orphan",
+        order_by="DeliveryReview.created_at",
+    )
     delivery_archive = relationship("DeliveryArchive", back_populates="batch", uselist=False, cascade="all, delete-orphan")
     rework_records = relationship("ReworkRecord", back_populates="batch", cascade="all, delete-orphan")
+
+    @property
+    def delivery_review(self):
+        # 复核记录只增不删，对外仍暴露"最新一条"以保持读取契约不变
+        return self.delivery_reviews[-1] if self.delivery_reviews else None
 
 
 class ProcessRecord(Base):
@@ -188,7 +198,7 @@ class DeliveryReview(Base):
     __tablename__ = "delivery_reviews"
 
     id = Column(Integer, primary_key=True, index=True)
-    batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False, unique=True)
+    batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False)
     reviewer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     review_time = Column(DateTime, nullable=False)
     delivered_quantity = Column(Integer, nullable=False)
@@ -197,7 +207,7 @@ class DeliveryReview(Base):
     exception_remark = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
 
-    batch = relationship("Batch", back_populates="delivery_review")
+    batch = relationship("Batch", back_populates="delivery_reviews")
     reviewer = relationship("User")
 
 

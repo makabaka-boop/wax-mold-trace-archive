@@ -1,6 +1,18 @@
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field, ConfigDict
+
+
+# 数据契约：状态取值集合，与数据库 CheckConstraint 及前端 TS 联合类型保持一致
+# 任何非法取值都会在 API 边界被 pydantic 拦截并返回 422
+BatchStatus = Literal[
+    "pending_pour", "molding", "pending_inspect", "reworking",
+    "deliverable", "delivered", "paused"
+]
+ReviewStatus = Literal["not_required", "pending_review", "reviewed"]
+ReworkStatus = Literal[
+    "pending", "processing", "waiting_inspection", "completed", "cancelled"
+]
 
 
 class ApiResponse(BaseModel):
@@ -187,14 +199,14 @@ class BatchCreate(BatchBase):
 
 
 class BatchUpdateStatus(BaseModel):
-    status: str
+    status: BatchStatus
     remark: Optional[str] = None
 
 
 class Batch(BatchBase):
     id: int
-    status: str
-    review_status: str = "not_required"
+    status: BatchStatus
+    review_status: ReviewStatus = "not_required"
     actual_start_date: Optional[datetime] = None
     actual_end_date: Optional[datetime] = None
     created_at: datetime
@@ -353,10 +365,9 @@ class BubbleRecordCreate(BaseModel):
     remark: Optional[str] = None
 
 
-class ReworkRecordCreate(BaseModel):
+class ProcessReworkRecordCreate(BaseModel):
     record_time: datetime
     rework_reason: str
-    rework_count: int
     remark: Optional[str] = None
 
 
@@ -456,7 +467,7 @@ class PendingDeliveryReviewItem(BaseModel):
 class ReworkRecordBase(BaseModel):
     batch_id: int
     rework_reason: str
-    handling_instruction: Optional[str] = None
+    handling_instruction: str = Field(min_length=1)
     responsible_id: int
     expected_finish_time: Optional[datetime] = None
 
@@ -480,7 +491,7 @@ class ReworkRecord(BaseModel):
     rework_no: int
     initiator_id: int
     responsible_id: int
-    status: str
+    status: ReworkStatus
     rework_reason: str
     handling_instruction: Optional[str] = None
     expected_finish_time: Optional[datetime] = None
