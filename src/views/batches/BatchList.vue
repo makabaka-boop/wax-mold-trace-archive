@@ -126,7 +126,7 @@
           <el-input v-model="createForm.code" placeholder="请输入批次号" />
         </el-form-item>
         <el-form-item label="款式" prop="style_id">
-          <el-select v-model="createForm.style_id" placeholder="请选择款式" style="width: 100%;">
+          <el-select v-model="createForm.style_id" placeholder="请选择款式" style="width: 100%;" @change="onStyleChange">
             <el-option v-for="style in styles" :key="style.id" :label="style.name" :value="style.id" />
           </el-select>
         </el-form-item>
@@ -135,7 +135,7 @@
             <el-option
               v-for="wb in waxBatches"
               :key="wb.id"
-              :label="`${wb.code} - ${wb.material}`"
+              :label="`${wb.code} - ${wb.material}（库存 ${wb.quantity} 件）`"
               :value="wb.id"
             />
           </el-select>
@@ -143,17 +143,20 @@
         <el-form-item label="模具" prop="mold_id">
           <el-select v-model="createForm.mold_id" placeholder="请选择模具" style="width: 100%;">
             <el-option
-              v-for="mold in molds"
+              v-for="mold in filteredMolds"
               :key="mold.id"
-              :label="`${mold.code} - ${mold.name}`"
+              :label="`${mold.code} - ${mold.name}（${mold.max_cavities} 穴）`"
               :value="mold.id"
             />
           </el-select>
+          <span v-if="createForm.style_id && filteredMolds.length === 0" style="color: #f56c6c; font-size: 12px;">
+            该款式下暂无可用模具
+          </span>
         </el-form-item>
         <el-form-item label="台位" prop="station_id">
-          <el-select v-model="createForm.station_id" placeholder="请选择台位" style="width: 100%;">
+          <el-select v-model="createForm.station_id" placeholder="请选择浇注台" style="width: 100%;">
             <el-option
-              v-for="station in stations"
+              v-for="station in pourStations"
               :key="station.id"
               :label="`${station.code} - ${station.name}`"
               :value="station.id"
@@ -199,7 +202,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, RefreshRight } from '@element-plus/icons-vue'
@@ -229,6 +232,15 @@ const molds = ref<Mold[]>([])
 const stations = ref<Station[]>([])
 const technicians = ref<User[]>([])
 
+const filteredMolds = computed(() => {
+  if (!createForm.style_id) return molds.value
+  return molds.value.filter(m => m.style_id === createForm.style_id)
+})
+
+const pourStations = computed(() => {
+  return stations.value.filter(s => s.type === 'pour')
+})
+
 const filterForm = reactive({
   style_id: null as number | null,
   status: null as string | null,
@@ -255,8 +267,32 @@ const createRules: FormRules = {
   wax_batch_id: [{ required: true, message: '请选择蜡料炉次', trigger: 'change' }],
   mold_id: [{ required: true, message: '请选择模具', trigger: 'change' }],
   station_id: [{ required: true, message: '请选择台位', trigger: 'change' }],
-  planned_start_date: [{ required: true, message: '请选择计划开始日期', trigger: 'change' }],
-  planned_end_date: [{ required: true, message: '请选择计划结束日期', trigger: 'change' }],
+  planned_start_date: [
+    { required: true, message: '请选择计划开始日期', trigger: 'change' },
+    {
+      validator: (_rule, value, callback) => {
+        if (value && createForm.planned_end_date && value > createForm.planned_end_date) {
+          callback(new Error('计划开始日期不能晚于计划结束日期'))
+        } else {
+          callback()
+        }
+      },
+      trigger: 'change'
+    }
+  ],
+  planned_end_date: [
+    { required: true, message: '请选择计划结束日期', trigger: 'change' },
+    {
+      validator: (_rule, value, callback) => {
+        if (value && createForm.planned_start_date && createForm.planned_start_date > value) {
+          callback(new Error('计划结束日期不能早于计划开始日期'))
+        } else {
+          callback()
+        }
+      },
+      trigger: 'change'
+    }
+  ],
   quantity: [{ required: true, message: '请输入试制件数', trigger: 'blur' }]
 }
 
@@ -350,6 +386,10 @@ const resetFilter = () => {
   filterForm.technician_id = null
   filterForm.date_range = null
   loadData()
+}
+
+const onStyleChange = () => {
+  createForm.mold_id = null
 }
 
 const openCreateDialog = () => {

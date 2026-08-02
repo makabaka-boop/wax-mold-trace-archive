@@ -75,7 +75,8 @@ def get_summary(
         status_counts[s] = count
 
     from .warnings import get_all_warnings_internal
-    warnings = get_all_warnings_internal(db)
+    warnings = get_all_warnings_internal(db, style_id, status, technician_id,
+                                         start_date, end_date, keyword)
 
     pending_review_count = base_query.filter(
         models.Batch.status == "deliverable",
@@ -84,17 +85,28 @@ def get_summary(
 
     from datetime import datetime
     now = datetime.now()
-    pending_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"])
-    ).count()
-    overdue_rework_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status.in_(["pending", "processing"]),
-        models.ReworkRecord.expected_finish_time.isnot(None),
-        models.ReworkRecord.expected_finish_time < now
-    ).count()
-    waiting_rework_inspection_count = db.query(models.ReworkRecord).filter(
-        models.ReworkRecord.status == "waiting_inspection"
-    ).count()
+
+    filtered_batch_ids = [b.id for b in base_query.with_entities(models.Batch.id).all()]
+
+    if filtered_batch_ids:
+        pending_rework_count = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id.in_(filtered_batch_ids),
+            models.ReworkRecord.status.in_(["pending", "processing"])
+        ).count()
+        overdue_rework_count = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id.in_(filtered_batch_ids),
+            models.ReworkRecord.status.in_(["pending", "processing"]),
+            models.ReworkRecord.expected_finish_time.isnot(None),
+            models.ReworkRecord.expected_finish_time < now
+        ).count()
+        waiting_rework_inspection_count = db.query(models.ReworkRecord).filter(
+            models.ReworkRecord.batch_id.in_(filtered_batch_ids),
+            models.ReworkRecord.status == "waiting_inspection"
+        ).count()
+    else:
+        pending_rework_count = 0
+        overdue_rework_count = 0
+        waiting_rework_inspection_count = 0
 
     summary = schemas.DashboardSummary(
         total_batches=total,
@@ -206,6 +218,7 @@ def get_pending_inspections(
 
     batches = query.order_by(models.Batch.created_at.desc()).all()
 
+    from .warnings import _get_pending_inspect_since
     result = []
     now = datetime.now().date()
     for batch in batches:
@@ -214,8 +227,14 @@ def get_pending_inspections(
         ).first()
 
         cycle_days = cycle.cycle_days if cycle else 7
-        days_since_created = (now - batch.created_at.date()).days
-        days_overdue = max(0, days_since_created - cycle_days)
+
+        since_time = _get_pending_inspect_since(db, batch.id)
+        if since_time:
+            since_date = since_time.date() if hasattr(since_time, 'date') else since_time
+            days_since = (now - since_date).days
+        else:
+            days_since = (now - batch.created_at.date()).days
+        days_overdue = max(0, days_since - cycle_days)
 
         result.append(schemas.PendingInspectionItem(
             id=batch.id,

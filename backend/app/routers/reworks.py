@@ -118,6 +118,19 @@ def create_rework(
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
 
+    if batch.status not in ["pending_inspect", "reworking"]:
+        raise HTTPException(status_code=400, detail="当前批次状态不允许发起返工")
+
+    existing_active = db.query(models.ReworkRecord).filter(
+        models.ReworkRecord.batch_id == rework_in.batch_id,
+        models.ReworkRecord.status.in_(["pending", "processing", "waiting_inspection"])
+    ).first()
+    if existing_active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该批次已有进行中的返工记录（第{existing_active.rework_no}次），请先完成或取消后再发起"
+        )
+
     last_rework = db.query(models.ReworkRecord).filter(
         models.ReworkRecord.batch_id == rework_in.batch_id
     ).order_by(models.ReworkRecord.rework_no.desc()).first()
@@ -173,6 +186,20 @@ def submit_rework_for_inspection(
 
     if rework.status not in ["processing", "pending"]:
         raise HTTPException(status_code=400, detail="当前状态不允许提交复检")
+
+    if rework.status == "pending":
+        rework.status = "processing"
+
+    process_record = models.ProcessRecord(
+        batch_id=rework.batch_id,
+        type="rework",
+        operator_id=current_user.id,
+        record_time=rework_in.actual_finish_time,
+        rework_reason=rework.rework_reason,
+        rework_count=None,
+        remark=rework_in.rework_result
+    )
+    db.add(process_record)
 
     rework.status = "waiting_inspection"
     rework.actual_finish_time = rework_in.actual_finish_time
